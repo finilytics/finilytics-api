@@ -1,14 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import time
+import pandas as pd
+import io
 from datetime import datetime
 
-app = FastAPI(
-    title="Finilytics API",
-    description="API de análisis inteligente de documentos financieros",
-    version="1.0.0"
-)
+app = FastAPI(title="Finilytics API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,23 +16,21 @@ app.add_middleware(
 
 @app.post("/procesar")
 async def procesar_documento(archivo: UploadFile = File(...)):
-    """
-    Endpoint principal - Formato compatible con Base44
-    """
     try:
-        # Leer archivo
         contenido = await archivo.read()
         nombre = archivo.filename.lower()
         extension = nombre.split('.')[-1]
         
-        # Detectar tipo de archivo
-        if extension in ['xlsx', 'xls', 'csv']:
-            file_type = detectar_tipo_reporte(nombre, contenido)
+        # LEER ARCHIVO REAL
+        if extension in ['xlsx', 'xls']:
+            df = pd.read_excel(io.BytesIO(contenido))
+        elif extension == 'csv':
+            df = pd.read_csv(io.BytesIO(contenido))
         else:
-            file_type = "otro"
+            return {"success": False, "error": "Formato no soportado"}
         
-        # Generar análisis según tipo
-        analysis = generar_analisis(file_type, nombre)
+        file_type = detectar_tipo_reporte(nombre)
+        analysis = analizar_dataframe_real(file_type, df)
         
         return {
             "success": True,
@@ -45,132 +39,84 @@ async def procesar_documento(archivo: UploadFile = File(...)):
         }
         
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
-def detectar_tipo_reporte(nombre: str, contenido: bytes) -> str:
-    """Detecta el tipo de reporte basado en el nombre"""
+def detectar_tipo_reporte(nombre: str) -> str:
     nombre_lower = nombre.lower()
     
     if any(x in nombre_lower for x in ['coste', 'costo', 'venta', 'margen']):
         return "coste_ventas"
     elif any(x in nombre_lower for x in ['compra', 'proveedor', 'gasto']):
-        return "compras"
+        return "compras_gastos"
     elif any(x in nombre_lower for x in ['pago', 'banco', 'transferencia']):
         return "pagos_banco"
     elif any(x in nombre_lower for x in ['inventario', 'stock', 'producto']):
         return "inventario"
-    else:
-        return "otro"
+    return "otro"
 
-def generar_analisis(file_type: str, nombre: str) -> dict:
-    """Genera el análisis en formato Base44"""
+def analizar_dataframe_real(file_type: str, df: pd.DataFrame) -> dict:
+    # Detectar fechas
+    fecha_cols = [col for col in df.columns if 'fecha' in str(col).lower() or 'date' in str(col).lower()]
+    fechas = []
+    if fecha_cols:
+        fechas = pd.to_datetime(df[fecha_cols[0]], errors='coerce').dropna()
     
-    # Fechas de ejemplo (en producción se extraen del archivo)
-    hoy = datetime.now()
-    inicio_mes = hoy.replace(day=1).strftime("%Y-%m-%d")
-    fin_mes = hoy.strftime("%Y-%m-%d")
+    period_start = fechas.min().strftime("%Y-%m-%d") if len(fechas) > 0 else None
+    period_end = fechas.max().strftime("%Y-%m-%d") if len(fechas) > 0 else None
     
-    base_analysis = {
-        "data_category": "mixed",
-        "period_start": inicio_mes,
-        "period_end": fin_mes
+    # Detectar columnas numéricas
+    columnas_num = df.select_dtypes(include=['number']).columns.tolist()
+    
+    # Detectar columna de categoría (primera columna de texto)
+    columnas_texto = df.select_dtypes(include=['object']).columns.tolist()
+    col_categoria = columnas_texto[0] if columnas_texto else None
+    
+    clasificaciones = {}
+    
+    if col_categoria and columnas_num:
+        for _, row in df.iterrows():
+            categoria = str(row[col_categoria]).strip()
+            if not categoria or categoria == 'nan':
+                continue
+            
+            # Buscar el monto (última columna numérica suele ser el total)
+            monto = float(row[columnas_num[-1]]) if len(columnas_num) > 0 else 0
+            
+            # Clasificar automáticamente
+            rol = "GASTO_OPERATIVO"
+            if any(x in categoria.lower() for x in ['mercancía', 'producto', 'inventario']):
+                rol = "INVENTARIO"
+            elif any(x in categoria.lower() for x in ['nómina', 'sueldo', 'salario']):
+                rol = "NOMINA"
+            elif any(x in categoria.lower() for x in ['venta', 'ingreso']):
+                rol = "INGRESO"
+            
+            clasificaciones[categoria] = {
+                "rol": rol,
+                "subcategoria": categoria,
+                "monto": round(monto, 2)
+            }
+    
+    # Calcular totales
+    totales = {
+        "ingresos": sum(c["monto"] for c in clasificaciones.values() if c["rol"] == "INGRESO"),
+        "costo_ventas": sum(c["monto"] for c in clasificaciones.values() if c["rol"] == "COSTO_VENTAS"),
+        "nomina": sum(abs(c["monto"]) for c in clasificaciones.values() if c["rol"] == "NOMINA"),
+        "gastos_operativos": sum(abs(c["monto"]) for c in clasificaciones.values() if c["rol"] == "GASTO_OPERATIVO"),
+        "inventario_comprado": sum(abs(c["monto"]) for c in clasificaciones.values() if c["rol"] == "INVENTARIO"),
     }
     
-    if file_type == "coste_ventas":
-        return {
-            **base_analysis,
-            "data_category": "cost_of_goods",
-            "ingresos": 50000,
-            "costo_ventas": 30000,
-            "gastos_operativos": 5000,
-            "nomina": 3000,
-            "inventario_comprado": 2000,
-            "entradas_banco": 10000,
-            "salidas_banco": 8000
-        }
-    
-    elif file_type == "compras":
-        return {
-            **base_analysis,
-            "data_category": "operating_expenses",
-            "clasificaciones": {
-                "Proveedor A": {
-                    "rol": "COSTO_VENTAS",
-                    "subcategoria": "Materia prima",
-                    "monto": 15000.00
-                },
-                "Proveedor B": {
-                    "rol": "GASTO_OPERATIVO", 
-                    "subcategoria": "Servicios",
-                    "monto": 2500.50
-                }
-            },
-            "gastos_operativos": 2500.50,
-            "nomina": 0,
-            "inventario_comprado": 15000.00,
-            "entradas_banco": 0,
-            "salidas_banco": 17500.50
-        }
-    
-    elif file_type == "inventario":
-        return {
-            **base_analysis,
-            "data_category": "inventory",
-            "productos": [
-                {
-                    "nombre": "Producto A",
-                    "cantidad": 100,
-                    "valor_unitario": 50.00,
-                    "valor_total": 5000.00
-                },
-                {
-                    "nombre": "Producto B",
-                    "cantidad": 50,
-                    "valor_unitario": 75.00,
-                    "valor_total": 3750.00
-                }
-            ],
-            "gastos_operativos": 0,
-            "nomina": 0,
-            "inventario_comprado": 8750.00,
-            "entradas_banco": 0,
-            "salidas_banco": 0
-        }
-    
-    else:
-        return {
-            **base_analysis,
-            "data_category": "mixed",
-            "gastos_operativos": 0,
-            "nomina": 0,
-            "inventario_comprado": 0,
-            "entradas_banco": 0,
-            "salidas_banco": 0
-        }
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "clasificaciones": clasificaciones,
+        **totales
+    }
 
 @app.get("/health")
 def health_check():
-    return {
-        "status": "operational",
-        "servicio": "finilytics-api",
-        "version": "1.0.0-base44-compatible"
-    }
+    return {"status": "operational", "version": "1.0.0"}
 
 @app.get("/")
 def root():
-    return {
-        "bienvenido_a": "Finilytics API",
-        "version": "Base44 Compatible",
-        "endpoints": {
-            "procesar": "POST /procesar",
-            "health": "GET /health"
-        }
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return {"bienvenido_a": "Finilytics API"}
